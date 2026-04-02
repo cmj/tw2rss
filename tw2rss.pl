@@ -236,7 +236,7 @@ class TwitterScraper:
 <link>https://twitter.com/{}</link>
 <description>Twitter Feed for @{}</description>
 """.format(username, username, username)
-        tweets = sorted(tweets, key=lambda x: x['id'], reverse=False)
+        tweets = sorted(tweets, key=lambda x: x['id'], reverse=True)
         limit_trimmed = 15
         for t in tweets[:limit_trimmed]:
             tweet_id = t['id']
