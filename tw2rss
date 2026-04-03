@@ -67,7 +67,7 @@ class TwitterScraper:
         self.HEADERS = HEADERS
         assert username
         self.username = username
-        print(f"DEBUG: tw2rss {auth_token} username = {self.username}", file=sys.stderr)
+        #print(f"DEBUG: tw2rss {auth_token} username = {self.username}", file=sys.stderr)
 
     def get_user(self):
         arg = {"screen_name": self.username, "withSafetyModeUserFields": True}
