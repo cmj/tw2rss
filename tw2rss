@@ -1,16 +1,15 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 """
 GGI script - Generate RSS feed from twitter user
 query parameters:
   u = username
   l = limit of items
   r = for all tweets and replies
-defaults to @nasa, 10 items and no replies
-(replies query may have a heavier rate-limit) 
-ex: http://host/cgi-bin/tw2rss?u=NWS&r=1
+defaults to @nasa and no replies
+ex: http://host/cgi-bin/tw2rss?u=NWS&r=1&l=15
 """
+import os
 import sys
-import sqlite3
 import json
 import requests
 import argparse
@@ -22,18 +21,21 @@ import warnings
 from random import randint
 from time import sleep
 
-sleep(randint(1,20))
+# random offset to prevent overloading
+#sleep(randint(1,20))
 
 with warnings.catch_warnings():
     warnings.filterwarnings("ignore",category=DeprecationWarning)
     import cgi
 
-connection = sqlite3.connect('/usr/local/share/db/twitter.db')
-idcheck=connection.cursor()
+# database to check existing ids
+#connection = sqlite3.connect('/usr/local/share/db/twitter.db')
+#idcheck=connection.cursor()
+
 auths = [
-    "12412320fadf",
-    "fasdfk323423",
-    "all_auth_tokens_here"
+    "auth_tokens_here",
+    "abcdef1234567890abcdef1234567890abcdef12",
+    "21fedcba0987654321fedcba0987654321fedcba"
 ]
 
 ct0 = os.urandom(16).hex()
@@ -65,7 +67,7 @@ class TwitterScraper:
         self.HEADERS = HEADERS
         assert username
         self.username = username
-        #print(f"DEBUG: {auth_token} username = {self.username}", file=sys.stderr)
+        print(f"DEBUG: tw2rss {auth_token} username = {self.username}", file=sys.stderr)
 
     def get_user(self):
         arg = {"screen_name": self.username, "withSafetyModeUserFields": True}
@@ -242,11 +244,12 @@ class TwitterScraper:
             tweet_id = t['id']
             user = t['username']
             content = t['content']
-            twid = idcheck.execute("SELECT count(*) FROM tweets WHERE id = ?", (tweet_id,))
-            data=twid.fetchone()[0]
-            if data==0:
-                idcheck.execute("INSERT into tweets (user,content,id) values (?,?,?)", (user,content,tweet_id,))
-                connection.commit()
+            # for sqlite db
+            #twid = idcheck.execute("SELECT count(*) FROM tweets WHERE id = ?", (tweet_id,))
+            #data=twid.fetchone()[0]
+            #if data==0:
+            #    idcheck.execute("INSERT into tweets (user,content,id) values (?,?,?)", (user,content,tweet_id,))
+            #    connection.commit()
             
             rss += """\
 <item>
@@ -271,7 +274,7 @@ class TwitterScraper:
 
 def main():
     form = cgi.FieldStorage()
-    username = "elonmusk"
+    username = "nasa"
     replies = None
     limit = 20
     if "u" in form:
