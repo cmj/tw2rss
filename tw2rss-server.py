@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+
+# FastCGI + Twitter RSS generator - standalone server
+
+import os
+import time
+import json
+import random
+import logging
+import urllib.parse
+import re
+import requests
+
+# Logging
+# Set DEBUG=1 in the environment to enable verbose output, otherwise INFO only.
+_log_level = logging.DEBUG if os.environ.get('DEBUG') == '1' else logging.CRITICAL
+logging.basicConfig(
+    level=_log_level,
+    format='[%(asctime)s] %(levelname)s %(name)s: %(message)s',
+    datefmt='%H:%M:%S',
+)
+log = logging.getLogger('twitter2rss')
+
+# Config
+CACHE_TTL = 60
+DEFAULT_LIMIT = 20
+
+# auth pool — load from environment
+_raw_auths = os.environ.get('AUTH_TOKENS', '')
+auths = [t.strip() for t in _raw_auths.split(',') if t.strip()]
+if not auths:
+    raise RuntimeError("No AUTH_TOKENS found in environment. Set AUTH_TOKENS=token1,token2")
+
+auth_token = random.choice(auths)
+ct0 = os.urandom(16).hex()
+log.debug("Selected auth_token suffix=...%s  ct0=%s", auth_token[-6:], ct0)
+
+BEARER_TOKEN = os.environ.get(
+    'BEARER_TOKEN',
+    'AAAAAAAAAAAAAAAAAAAAAFXzAwAAAAAAMHCxpeSDG1gLNLghVe8d74hl6k4%3DRUMF4xAQLsbeBhTSRrCiQpJtxoGWeyHrDb5te2jpGskWDFW82F',
+)
+
+HEADERS = {
+    'authorization': f'Bearer {BEARER_TOKEN}',
+    'User-Agent': 'Mozilla/5.0',
+    'x-csrf-token': ct0,
+    'cookie': f'ct0={ct0}; auth_token={auth_token}',
+}
+
+# restored full feature flags
+FEATURES_USER = '{"hidden_profile_likes_enabled":false,"hidden_profile_subscriptions_enabled":true,"responsive_web_graphql_exclude_directive_enabled":true,"verified_phone_label_enabled":false,"subscriptions_verification_info_is_identity_verified_enabled":false,"subscriptions_verification_info_verified_since_enabled":true,"highlights_tweets_tab_ui_enabled":true,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"responsive_web_graphql_timeline_navigation_enabled":true}'
+
+FEATURES_TWEETS = '{"creator_subscriptions_tweet_preview_api_enabled":false,"communities_web_enable_tweet_community_results_fetch":false,"c9s_tweet_anatomy_moderator_badge_enabled":false,"articles_preview_enabled":false,"tweetypie_unmention_optimization_enabled":false,"responsive_web_edit_tweet_api_enabled":false,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":false,"view_counts_everywhere_api_enabled":false,"longform_notetweets_consumption_enabled":false,"responsive_web_twitter_article_tweet_consumption_enabled":false,"tweet_awards_web_tipping_enabled":false,"creator_subscriptions_quote_tweet_preview_enabled":false,"freedom_of_speech_not_reach_fetch_enabled":false,"standardized_nudges_misinfo":false,"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled":false,"tweet_with_visibility_results_prefer_gql_media_interstitial_enabled":false,"rweb_video_timestamps_enabled":false,"longform_notetweets_rich_text_read_enabled":true,"longform_notetweets_inline_media_enabled":true,"rweb_tipjar_consumption_enabled":false,"responsive_web_graphql_exclude_directive_enabled":false,"verified_phone_label_enabled":false,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"responsive_web_graphql_timeline_navigation_enabled":false,"responsive_web_enhance_cards_enabled":false,"rweb_lists_timeline_redesign_enabled":false,"responsive_web_media_download_video_enabled":false}'
+
+GET_USER_URL = 'https://x.com/i/api/graphql/SAMkL5y_N9pmahSw8yy6gw/UserByScreenName'
+GET_TWEETS_URL = 'https://x.com/i/api/graphql/XicnWRbyQ3WgVY__VataBQ/UserTweets'
+GET_TWEETS_AND_REPLIES_URL = 'https://x.com/i/api/graphql/-gxtzCQbBPmOwxnY-SbiHQ/UserTweetsAndReplies'
+
+TWEET_URL = 'http://nitter'
+
+cache = {}
+URL_RE = re.compile(r'(https?://[^\s]+)')
+
+
+def _log_request(prepared: requests.PreparedRequest) -> None:
+    """Log the full outgoing request URL and headers at DEBUG level.
+    Redacts the auth token and bearer token values so they never appear
+    in plain text in log files."""
+    log.debug("── REQUEST ──────────────────────────────")
+    log.debug("  %s %s", prepared.method, prepared.url)
+    for k, v in prepared.headers.items():
+        k_lower = k.lower()
+        if k_lower == 'authorization':
+            v = v[:12] + '...<redacted>'
+        elif k_lower == 'cookie':
+            v = re.sub(r'(auth_token=)[^;]+', r'\1<redacted>', v)
+        log.debug("  %s: %s", k, v)
+    log.debug("─────────────────────────────────────────")
+
+
+def _log_response(response: requests.Response, elapsed: float) -> None:
+    """Log response status, headers, and a body excerpt at DEBUG level."""
+    log.debug("── RESPONSE  %s  %.0fms ─────────────────────", response.status_code, elapsed * 1000)
+    for k, v in response.headers.items():
+        log.debug("  %s: %s", k, v)
+    if response.content:
+        snippet = response.text[:400].replace('\n', ' ')
+        log.debug("  body(first 400): %s", snippet)
+    log.debug("─────────────────────────────────────────")
+
+
+def linkify(text: str) -> str:
+    return URL_RE.sub(lambda m: f'<a href="{m.group(0)}">{m.group(0)}</a>', text or '')
+
+
+def render_media(media_list):
+    html = []
+
+    for m in media_list:
+        mtype = m.get('type')
+        poster = m.get('media_url_https')
+
+        if mtype == 'photo':
+            if poster:
+                html.append(f'<br/><img src="{poster}" loading="lazy" />')
+
+        elif mtype in ('video', 'animated_gif'):
+            variants = m.get('video_info', {}).get('variants', [])
+            mp4s = [v for v in variants if v.get('content_type') == 'video/mp4']
+            if mp4s:
+                best = max(mp4s, key=lambda v: v.get('bitrate', 0))
+                video_url = best.get('url')
+                if video_url:
+                    html.append(f'<br/><video controls poster="{poster}" src="{video_url}"></video>')
+
+    return ''.join(html)
+
+
+class TwitterRSS:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS)
+        log.debug("TwitterRSS session initialised with %d headers", len(HEADERS))
+
+    def _get(self, url, params):
+        req = requests.Request('GET', url, params=params, headers=dict(self.session.headers))
+        prepared = self.session.prepare_request(req)
+        _log_request(prepared)
+
+        t0 = time.monotonic()
+        r = self.session.send(prepared, timeout=10)
+        elapsed = time.monotonic() - t0
+
+        _log_response(r, elapsed)
+        log.info("GET %s  →  %s  (%.0fms)", url.split('/')[-1], r.status_code, elapsed * 1000)
+
+        r.raise_for_status()
+        return r.json()
+
+    def get_user(self, username):
+        log.debug("get_user: looking up @%s", username)
+        arg = {"screen_name": username, "withSafetyModeUserFields": True}
+        params = {
+            'variables': json.dumps(arg),
+            'features': FEATURES_USER,
+        }
+
+        try:
+            t0 = time.monotonic()
+            response = self.session.get(GET_USER_URL, params=params, timeout=10)
+            elapsed = time.monotonic() - t0
+
+            _log_request(response.request)
+            _log_response(response, elapsed)
+            log.info("get_user @%s  →  %s  (%.0fms)", username, response.status_code, elapsed * 1000)
+
+            json_response = response.json()
+        except requests.exceptions.JSONDecodeError:
+            log.error("get_user: JSON decode failed  status=%s  body=%s",
+                      response.status_code, response.text[:200])
+            raise
+
+        result = json_response["data"]["user"]["result"]
+        legacy = result["legacy"]
+        user_info = {
+            "id": result["rest_id"],
+            "username": legacy["screen_name"],
+            "full_name": legacy["name"],
+        }
+        log.debug("get_user resolved: %s", user_info)
+        return user_info
+
+    def get_tweets(self, username, limit=DEFAULT_LIMIT, with_replies=False):
+        log.info("get_tweets: @%s  limit=%d  with_replies=%s", username, limit, with_replies)
+        url = GET_TWEETS_AND_REPLIES_URL if with_replies else GET_TWEETS_URL
+
+        _user = self.get_user(username)
+        full_name = _user.get("full_name")
+        user_id = _user.get("id")
+        log.debug("get_tweets: resolved user_id=%s  full_name=%s", user_id, full_name)
+
+        params = {
+            'variables': json.dumps({
+                'userId': user_id,
+                'count': min(limit, 20),
+                'includePromotedContent': False,
+                'withQuickPromoteEligibilityTweetFields': False,
+                'withVoice': True,
+                'withV2Timeline': True,
+            }),
+            'features': FEATURES_TWEETS,
+        }
+
+        data = self._get(url, params)
+
+        out = []
+        skipped = 0
+
+        instructions = (
+            data.get('data', {})
+                .get('user', {})
+                .get('result', {})
+                .get('timeline_v2', {})
+                .get('timeline', {})
+                .get('instructions', [])
+        )
+        log.debug("get_tweets: %d instruction blocks received", len(instructions))
+
+        for ins in instructions:
+            for e in ins.get('entries', []):
+                entry_id = e.get('entryId', '')
+
+                # Cursor entries (Top/Bottom) are never tweets — skip immediately
+                # without counting them as parse errors.
+                if 'cursor' in entry_id.lower():
+                    log.debug("  skipped cursor entry: %s", entry_id)
+                    continue
+
+                try:
+                    item_content = e['content']['itemContent']
+                    entry_type = item_content.get('itemType', '')
+
+                    # Only process actual tweet entries
+                    if entry_type != 'TimelineTweet':
+                        log.debug("  skipped non-tweet entry type=%r  entryId=%s",
+                                  entry_type, entry_id)
+                        continue
+
+                    result = item_content['tweet_results']['result']
+                    result_type = result.get('__typename', '')
+
+                    # 'tweetWithVisibilityResults' wraps the real tweet one level deeper
+                    if result_type == 'TweetWithVisibilityResults':
+                        result = result['tweet']
+                        log.debug("  unwrapped TweetWithVisibilityResults for entryId=%s", entry_id)
+                    elif result_type != 'Tweet':
+                        log.debug("  skipped unknown result __typename=%r  entryId=%s",
+                                  result_type, entry_id)
+                        continue
+
+                    t = result['legacy']
+                    user = result['core']['user_results']['result']['legacy']
+
+                    tid = t.get('id_str')
+                    media = t.get('extended_entities', {}).get('media', [])
+
+                    # Extract quoted tweet if present
+                    quoted = None
+                    qt_result = result.get('quoted_status_result', {}).get('result')
+                    if qt_result:
+                        qt_type = qt_result.get('__typename', '')
+                        if qt_type == 'TweetWithVisibilityResults':
+                            qt_result = qt_result['tweet']
+                        if qt_result.get('legacy'):
+                            qt_legacy = qt_result['legacy']
+                            qt_user = qt_result.get('core', {}).get('user_results', {}).get('result', {}).get('legacy', {})
+                            qt_tid = qt_legacy.get('id_str')
+                            quoted = {
+                                'id': qt_tid,
+                                'username': qt_user.get('screen_name'),
+                                'name': qt_user.get('name'),
+                                'content': qt_legacy.get('full_text'),
+                                'media': qt_legacy.get('extended_entities', {}).get('media', []),
+                                'tweet_url': f"{TWEET_URL}/{qt_user.get('screen_name')}/status/{qt_tid}",
+                            }
+                            log.debug("  found quoted tweet id=%s", qt_tid)
+
+                    out.append({
+                        'id': tid,
+                        'username': user.get('screen_name'),
+                        'name': user.get('name'),
+                        'published_at': t.get('created_at'),
+                        'content': t.get('full_text'),
+                        'media': media,
+                        'tweet_url': f"{TWEET_URL}/{user.get('screen_name')}/status/{tid}",
+                        'quoted': quoted,
+                    })
+                    log.debug("  parsed tweet id=%s  media=%d  quoted=%s",
+                              tid, len(media), quoted['id'] if quoted else None)
+
+                    if len(out) >= limit:
+                        log.debug("get_tweets: hit limit %d, stopping early", limit)
+                        return out
+
+                except Exception as exc:
+                    skipped += 1
+                    log.debug("  skipped entry entryId=%s (parse error): %s", entry_id, exc)
+                    continue
+
+        log.info("get_tweets: collected %d tweets, skipped %d entries", len(out), skipped)
+        return out
+
+    def build_rss(self, username, items):
+        log.debug("build_rss: building feed for @%s with %d items", username, len(items))
+        parts = []
+
+        for t in items:
+            text_html = linkify(t['content'])
+            media_html = render_media(t.get('media', []))
+
+            quoted_html = ''
+            q = t.get('quoted')
+            if q:
+                q_text_html = linkify(q['content'])
+                q_media_html = render_media(q.get('media', []))
+                quoted_html = (
+                    f'<blockquote>'
+                    f'<b><a href="{q["tweet_url"]}">{q["name"]} @{q["username"]}</a></b><br/>'
+                    f'{q_text_html}{q_media_html}'
+                    f'</blockquote>'
+                )
+
+            parts.append(f"""
+            <item>
+                <title><![CDATA[{t['content']}]]></title>
+                <description><![CDATA[{text_html}{media_html}{quoted_html}]]></description>
+                <link>{t['tweet_url']}</link>
+                <pubDate>{t['published_at']}</pubDate>
+            </item>
+            """)
+
+        feed = f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<rss version=\"2.0\">
+  <channel>
+    <title>{username}</title>
+    <link>{TWEET_URL}/{username}</link>
+    {''.join(parts)}
+  </channel>
+</rss>"""
+        log.debug("build_rss: feed size %d bytes", len(feed))
+        return feed
+
+
+twitter = TwitterRSS()
+
+
+def parse_qs(qs):
+    return dict(urllib.parse.parse_qsl(qs, keep_blank_values=True))
+
+
+def app(environ, start_response):
+    params = parse_qs(environ.get('QUERY_STRING', ''))
+    username = params.get('user', 'elonmusk')
+    log.info("app: request  user=%s  qs=%s", username, environ.get('QUERY_STRING', ''))
+
+    try:
+        limit = max(1, min(int(params.get('limit', DEFAULT_LIMIT)), 100))
+    except ValueError:
+        log.warning("app: invalid limit=%r", params.get('limit'))
+        start_response('400 Bad Request', [('Content-Type', 'text/plain')])
+        return [b"'limit' must be an integer"]
+
+    with_replies = params.get('replies', '0') == '1'
+
+    key = f"{username}:{limit}:{int(with_replies)}"
+    now = time.time()
+
+    if key in cache:
+        ts, payload = cache[key]
+        age = now - ts
+        if age < CACHE_TTL:
+            log.info("app: cache HIT  key=%s  age=%.1fs", key, age)
+            start_response('200 OK', [('Content-Type', 'application/rss+xml')])
+            return [payload]
+        else:
+            log.debug("app: cache STALE  key=%s  age=%.1fs  evicting", key, age)
+            del cache[key]
+
+    log.info("app: cache MISS  key=%s", key)
+    try:
+        t0 = time.monotonic()
+        items = twitter.get_tweets(username, limit, with_replies)
+        rss = twitter.build_rss(username, items).encode()
+        elapsed = time.monotonic() - t0
+
+        cache[key] = (now, rss)
+        log.info("app: feed built  items=%d  size=%d bytes  total=%.0fms",
+                 len(items), len(rss), elapsed * 1000)
+
+        start_response('200 OK', [('Content-Type', 'application/rss+xml')])
+        return [rss]
+    except Exception as e:
+        log.exception("app: unhandled error for user=%s: %s", username, e)
+        start_response('500 Internal Server Error', [('Content-Type', 'text/plain')])
+        return [str(e).encode()]
+
+
+if __name__ == '__main__':
+    import argparse
+    from wsgiref.simple_server import make_server
+
+    parser = argparse.ArgumentParser(description='twitter2rss debug server')
+    parser.add_argument('--host', default='127.0.0.1')
+    parser.add_argument('--port', type=int, default=8080)
+    parser.add_argument('--user', default='NASA', help='Default Twitter username to fetch')
+    args = parser.parse_args()
+
+    print(f'Serving on http://{args.host}:{args.port}/?user={args.user}')
+    print('Press Ctrl+C to stop.')
+
+    with make_server(args.host, args.port, app) as httpd:
+        httpd.serve_forever()
