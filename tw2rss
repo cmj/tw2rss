@@ -7,31 +7,20 @@ import os
 import time
 import json
 import random
-import logging
 import urllib.parse
 import re
 import requests
 from datetime import datetime
 
 # config
-TWEET_URL = 'http://nitter' # Nitter instance (or x.com)
+TWEET_URL = 'http://nitter'
 CACHE_TTL = 60
 DEFAULT_LIMIT = 20
-USER_URL = 'https://x.com/i/api/graphql/SAMkL5y_N9pmahSw8yy6gw/UserByScreenName'
-TWEETS_URL = 'https://x.com/i/api/graphql/XicnWRbyQ3WgVY__VataBQ/UserTweets'
-TWEETS_AND_REPLIES_URL = 'https://x.com/i/api/graphql/-gxtzCQbBPmOwxnY-SbiHQ/UserTweetsAndReplies'
+GET_USER_URL = 'https://x.com/i/api/graphql/SAMkL5y_N9pmahSw8yy6gw/UserByScreenName'
+GET_TWEETS_URL = 'https://x.com/i/api/graphql/XicnWRbyQ3WgVY__VataBQ/UserTweets'
+GET_TWEETS_AND_REPLIES_URL = 'https://x.com/i/api/graphql/-gxtzCQbBPmOwxnY-SbiHQ/UserTweetsAndReplies'
 
-# logging
-# Set DEBUG=1 in the environment to enable verbose output, otherwise CRITICAL only.
-_log_level = logging.DEBUG if os.environ.get('DEBUG') == '1' else logging.CRITICAL
-logging.basicConfig(
-    level=_log_level,
-    format='[%(asctime)s] %(levelname)s %(name)s: %(message)s',
-    datefmt='%H:%M:%S',
-)
-log = logging.getLogger('tw2rss')
-
-# auth_token pool — load from environment
+# auth pool — load from environment
 _raw_auths = os.environ.get('AUTH_TOKENS', '')
 auths = [t.strip() for t in _raw_auths.split(',') if t.strip()]
 if not auths:
@@ -39,7 +28,6 @@ if not auths:
 
 auth_token = random.choice(auths)
 ct0 = os.urandom(16).hex()
-log.debug("Selected auth_token suffix=...%s  ct0=%s", auth_token[-6:], ct0)
 
 BEARER_TOKEN = os.environ.get(
     'BEARER_TOKEN',
@@ -48,44 +36,18 @@ BEARER_TOKEN = os.environ.get(
 
 HEADERS = {
     'authorization': f'Bearer {BEARER_TOKEN}',
-    'User-Agent': 'Mozilla/5.0',
+    'User-Agent': 'TwitterAndroid/10.21.0-release.0 (310; Android 13; samsung SM-G991B; Build/TP1A.220624.014; Retrofit/2.9.0) okhttp/4.10.0 dalvik/2.1.0 (Linux; U; Android 13; SM-G991B Build/TP1A.220624.014)',
     'x-csrf-token': ct0,
     'cookie': f'ct0={ct0}; auth_token={auth_token}',
 }
 
+# restored full feature flags
 FEATURES_USER = '{"hidden_profile_likes_enabled":false,"hidden_profile_subscriptions_enabled":true,"responsive_web_graphql_exclude_directive_enabled":true,"verified_phone_label_enabled":false,"subscriptions_verification_info_is_identity_verified_enabled":false,"subscriptions_verification_info_verified_since_enabled":true,"highlights_tweets_tab_ui_enabled":true,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"responsive_web_graphql_timeline_navigation_enabled":true}'
 
 FEATURES_TWEETS = '{"creator_subscriptions_tweet_preview_api_enabled":false,"communities_web_enable_tweet_community_results_fetch":false,"c9s_tweet_anatomy_moderator_badge_enabled":false,"articles_preview_enabled":false,"tweetypie_unmention_optimization_enabled":false,"responsive_web_edit_tweet_api_enabled":false,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":false,"view_counts_everywhere_api_enabled":false,"longform_notetweets_consumption_enabled":false,"responsive_web_twitter_article_tweet_consumption_enabled":false,"tweet_awards_web_tipping_enabled":false,"creator_subscriptions_quote_tweet_preview_enabled":false,"freedom_of_speech_not_reach_fetch_enabled":false,"standardized_nudges_misinfo":false,"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled":false,"tweet_with_visibility_results_prefer_gql_media_interstitial_enabled":false,"rweb_video_timestamps_enabled":false,"longform_notetweets_rich_text_read_enabled":true,"longform_notetweets_inline_media_enabled":true,"rweb_tipjar_consumption_enabled":false,"responsive_web_graphql_exclude_directive_enabled":false,"verified_phone_label_enabled":false,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"responsive_web_graphql_timeline_navigation_enabled":false,"responsive_web_enhance_cards_enabled":false,"rweb_lists_timeline_redesign_enabled":false,"responsive_web_media_download_video_enabled":false}'
 
 cache = {}
 URL_RE = re.compile(r'(https?://[^\s]+)')
-
-def _log_request(prepared: requests.PreparedRequest) -> None:
-    """Log the full outgoing request URL and headers at DEBUG level.
-    Redacts the auth token and bearer token values so they never appear
-    in plain text in log files."""
-    log.debug("── REQUEST ──────────────────────────────")
-    log.debug("  %s %s", prepared.method, prepared.url)
-    for k, v in prepared.headers.items():
-        k_lower = k.lower()
-        if k_lower == 'authorization':
-            v = v[:12] + '...<redacted>'
-        elif k_lower == 'cookie':
-            v = re.sub(r'(auth_token=)[^;]+', r'\1<redacted>', v)
-        log.debug("  %s: %s", k, v)
-    log.debug("─────────────────────────────────────────")
-
-
-def _log_response(response: requests.Response, elapsed: float) -> None:
-    """Log response status, headers, and a body excerpt at DEBUG level."""
-    log.debug("── RESPONSE  %s  %.0fms ─────────────────────", response.status_code, elapsed * 1000)
-    for k, v in response.headers.items():
-        log.debug("  %s: %s", k, v)
-    if response.content:
-        snippet = response.text[:400].replace('\n', ' ')
-        log.debug("  body(first 400): %s", snippet)
-    log.debug("─────────────────────────────────────────")
-
 
 def linkify(text: str) -> str:
     return URL_RE.sub(lambda m: f'<a href="{m.group(0)}">{m.group(0)}</a>', text or '')
@@ -116,30 +78,20 @@ def render_media(media_list):
 
     return ''.join(html)
 
-
 class TwitterRSS:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
-        log.debug("TwitterRSS session initialised with %d headers", len(HEADERS))
 
     def _get(self, url, params):
         req = requests.Request('GET', url, params=params, headers=dict(self.session.headers))
         prepared = self.session.prepare_request(req)
-        _log_request(prepared)
-
-        t0 = time.monotonic()
         r = self.session.send(prepared, timeout=10)
-        elapsed = time.monotonic() - t0
-
-        _log_response(r, elapsed)
-        log.info("GET %s - %s (%.0fms)", url.split('/')[-1], r.status_code, elapsed * 1000)
 
         r.raise_for_status()
         return r.json()
 
     def get_user(self, username):
-        log.debug("get_user: looking up @%s", username)
         arg = {"screen_name": username, "withSafetyModeUserFields": True}
         params = {
             'variables': json.dumps(arg),
@@ -147,18 +99,10 @@ class TwitterRSS:
         }
 
         try:
-            t0 = time.monotonic()
-            response = self.session.get(USER_URL, params=params, timeout=10)
-            elapsed = time.monotonic() - t0
-
-            _log_request(response.request)
-            _log_response(response, elapsed)
-            log.info("get_user @%s - %s (%.0fms)", username, response.status_code, elapsed * 1000)
+            response = self.session.get(GET_USER_URL, params=params, timeout=10)
 
             json_response = response.json()
         except requests.exceptions.JSONDecodeError:
-            log.error("get_user: JSON decode failed  status=%s  body=%s",
-                      response.status_code, response.text[:200])
             raise
 
         result = json_response["data"]["user"]["result"]
@@ -168,22 +112,19 @@ class TwitterRSS:
             "username": legacy["screen_name"],
             "full_name": legacy["name"],
         }
-        log.debug("get_user resolved: %s", user_info)
         return user_info
 
     def get_tweets(self, username, limit=DEFAULT_LIMIT, with_replies=False):
-        log.info("get_tweets: @%s limit=%d with_replies=%s", username, limit, with_replies)
-        url = TWEETS_AND_REPLIES_URL if with_replies else TWEETS_URL
+        url = GET_TWEETS_AND_REPLIES_URL if with_replies else GET_TWEETS_URL
 
         _user = self.get_user(username)
         full_name = _user.get("full_name")
         user_id = _user.get("id")
-        log.debug("get_tweets: resolved user_id=%s full_name=%s", user_id, full_name)
 
         params = {
             'variables': json.dumps({
                 'userId': user_id,
-                'count': min(limit, 20),
+                'count': min(limit * 2, 100),  # request more so Twitter includes conversation modules
                 'includePromotedContent': False,
                 'withQuickPromoteEligibilityTweetFields': False,
                 'withVoice': True,
@@ -195,24 +136,16 @@ class TwitterRSS:
         data = self._get(url, params)
 
         out = []
-        skipped = 0
+        seen_ids = {}
 
-        instructions = (
-            data.get('data', {})
-                .get('user', {})
-                .get('result', {})
-                .get('timeline_v2', {})
-                .get('timeline', {})
-                .get('instructions', [])
-        )
-        log.debug("get_tweets: %d instruction blocks received", len(instructions))
+        user_result = data.get('data', {}).get('user', {}).get('result', {})
+        tl = (user_result.get('timeline_v2') or user_result.get('timeline') or {})
+        instructions = tl.get('timeline', {}).get('instructions', [])
 
         for ins in instructions:
             for e in ins.get('entries', []):
                 entry_id = e.get('entryId', '')
-
                 if 'cursor' in entry_id.lower():
-                    log.debug('skipped cursor entry: %s', entry_id)
                     continue
 
                 try:
@@ -222,14 +155,14 @@ class TwitterRSS:
                     if entry_type == 'TimelineTimelineItem':
                         item_content = content_block.get('itemContent', {})
                         if item_content.get('itemType') != 'TimelineTweet':
-                            log.debug('skipped non-tweet entry type=%r entryId=%s',
-                                      item_content.get('itemType'), entry_id)
                             continue
                         parsed = self._parse_tweet_result(item_content, entry_id)
                         if parsed:
-                            out.append(parsed)
+                            tid = parsed['id']
+                            if tid not in seen_ids:
+                                seen_ids[tid] = len(out)
+                                out.append(parsed)
                             if len(out) >= limit:
-                                log.debug('get_tweets: hit limit %d, stopping early', limit)
                                 return out
 
                     elif entry_type == 'TimelineTimelineModule':
@@ -247,23 +180,20 @@ class TwitterRSS:
                         reply_tweet = parsed_items[-1]
                         if len(parsed_items) > 1:
                             reply_tweet['reply_to'] = parsed_items[:-1]
-                        out.append(reply_tweet)
-                        log.debug('parsed conversation entryId=%s  items=%d  reply_id=%s',
-                                  entry_id, len(parsed_items), reply_tweet['id'])
+                        tid = reply_tweet['id']
+                        if tid in seen_ids:
+                            out[seen_ids[tid]] = reply_tweet
+                        else:
+                            seen_ids[tid] = len(out)
+                            out.append(reply_tweet)
                         if len(out) >= limit:
-                            log.debug('get_tweets: hit limit %d, stopping early', limit)
                             return out
 
                     else:
-                        log.debug('skipped unknown entryType=%r entryId=%s', entry_type, entry_id)
                         continue
 
-                except Exception as exc:
-                    skipped += 1
-                    log.debug('skipped entry entryId=%s (parse error): %s', entry_id, exc)
+                except Exception:
                     continue
-
-        log.info('get_tweets: collected %d tweets, skipped %d entries', len(out), skipped)
         return out
 
     def _parse_tweet_result(self, item_content, entry_id=''):
@@ -272,12 +202,14 @@ class TwitterRSS:
         if result_type == 'TweetWithVisibilityResults':
             result = result['tweet']
         elif result_type != 'Tweet':
-            log.debug('  skipped unknown result __typename=%r entryId=%s', result_type, entry_id)
             return None
 
         t = result['legacy']
         user = result['core']['user_results']['result']['legacy']
         tid = t.get('id_str')
+
+        note = result.get('note_tweet', {}).get('note_tweet_results', {}).get('result', {})
+        full_text = note.get('text') or t.get('full_text', '')
 
         _rt_peek = t.get('retweeted_status_result', {}).get('result')
         if _rt_peek:
@@ -350,7 +282,7 @@ class TwitterRSS:
             'username': user.get('screen_name'),
             'name': user.get('name'),
             'published_at': t.get('created_at'),
-            'content': t.get('full_text'),
+            'content': full_text,
             'media': media,
             'tweet_url': f"{TWEET_URL}/{user.get('screen_name')}/status/{tid}",
             'retweeted': retweeted,
@@ -359,7 +291,6 @@ class TwitterRSS:
         }
 
     def build_rss(self, username, items):
-        log.debug("build_rss: building feed for @%s with %d items", username, len(items))
         parts = []
 
         for t in items:
@@ -367,7 +298,6 @@ class TwitterRSS:
             tweet_id = t['id']
             tweet_url = f"{TWEET_URL}/{t['username']}/status/{tweet_id}"
             if rt:
-                # Full retweet: show retweeter credit, then original tweet in full
                 rt_text_html = linkify(rt['content'])
                 rt_media_html = render_media(rt.get('media', []))
                 title_text = f"RT @{rt['username']}: {rt['content']}"
@@ -404,7 +334,6 @@ class TwitterRSS:
                         f'</blockquote>'
                     )
 
-                # Render reply-to context (conversation thread parents)
                 reply_to_html = ''
                 for parent in t.get('reply_to', []):
                     p_text_html = linkify(parent['content'])
@@ -448,28 +377,21 @@ class TwitterRSS:
     {''.join(parts)}
   </channel>
 </rss>"""
-        log.debug("build_rss: feed size %d bytes", len(feed))
         return feed
 
-
 twitter = TwitterRSS()
-
 
 def parse_qs(qs):
     return dict(urllib.parse.parse_qsl(qs, keep_blank_values=True))
 
-
 def handle():
     import sys
-    # TODO query_string
     params = parse_qs(os.environ.get('QUERY_STRING', ''))
     username = params.get('user', 'NASA')
-    log.info("handle: request  user=%s  qs=%s", username, os.environ.get('QUERY_STRING', ''))
 
     try:
         limit = max(1, min(int(params.get('limit', DEFAULT_LIMIT)), 100))
     except ValueError:
-        log.warning("handle: invalid limit=%r", params.get('limit'))
         sys.stdout.write('Status: 400 Bad Request\r\n')
         sys.stdout.write('Content-Type: text/plain\r\n\r\n')
         sys.stdout.write("'limit' must be an integer")
@@ -484,35 +406,25 @@ def handle():
         ts, payload = cache[key]
         age = now - ts
         if age < CACHE_TTL:
-            log.info("handle: cache HIT  key=%s  age=%.1fs", key, age)
             sys.stdout.write('Content-Type: application/rss+xml\r\n\r\n')
             sys.stdout.flush()
             sys.stdout.buffer.write(payload)
             return
         else:
-            log.debug("handle: cache STALE  key=%s  age=%.1fs  evicting", key, age)
             del cache[key]
-
-    log.info("handle: cache MISS  key=%s", key)
     try:
-        t0 = time.monotonic()
         items = twitter.get_tweets(username, limit, with_replies)
         rss = twitter.build_rss(username, items).encode()
-        elapsed = time.monotonic() - t0
 
         cache[key] = (now, rss)
-        log.info("handle: feed built  items=%d  size=%d bytes  total=%.0fms",
-                 len(items), len(rss), elapsed * 1000)
 
         sys.stdout.write('Content-Type: application/rss+xml\r\n\r\n')
         sys.stdout.flush()
         sys.stdout.buffer.write(rss)
     except Exception as e:
-        log.exception("handle: unhandled error for user=%s: %s", username, e)
         sys.stdout.write('Status: 500 Internal Server Error\r\n')
         sys.stdout.write('Content-Type: text/plain\r\n\r\n')
         sys.stdout.write(str(e))
-
 
 if __name__ == '__main__':
     handle()

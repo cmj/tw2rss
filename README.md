@@ -11,16 +11,14 @@ cp tw2rss /usr/lib/cgi-bin/tw2rss
 chmod +x /usr/lib/cgi-bin/tw2rss
 
 # Create /etc/apache2/conf-available/tw2rss.conf to set auth_tokens:
-# Debug script: sends info, headers and urls to error.log
-#DEBUG 1
 SetEnv AUTH_TOKENS token1,token2
 
 # Then enable it:
-a2enconf twitter2rss
+a2enconf tw2rss
 systemctl reload apache2
 
 # access via
-http://yourserver/cgi-bin/twitter2rss?user=nasa&limit=20&replies=1
+http://yourserver/cgi-bin/tw2rss?user=nasa&limit=20&replies=1
 ```
 
 ### Twitter to RSS generator - standalone server
