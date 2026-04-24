@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
-# FastCGI + Twitter RSS generator - standalone server
+# Twitter RSS generator
+# Deploy to server cgi-bin and ensure the file is executable (chmod +x).
 
 import os
 import time
@@ -10,26 +11,31 @@ import logging
 import urllib.parse
 import re
 import requests
+from datetime import datetime
 
-# Logging
-# Set DEBUG=1 in the environment to enable verbose output, otherwise INFO only.
+# config
+TWEET_URL = 'http://nitter' # Nitter instance (or x.com)
+CACHE_TTL = 60
+DEFAULT_LIMIT = 20
+USER_URL = 'https://x.com/i/api/graphql/SAMkL5y_N9pmahSw8yy6gw/UserByScreenName'
+TWEETS_URL = 'https://x.com/i/api/graphql/XicnWRbyQ3WgVY__VataBQ/UserTweets'
+TWEETS_AND_REPLIES_URL = 'https://x.com/i/api/graphql/-gxtzCQbBPmOwxnY-SbiHQ/UserTweetsAndReplies'
+
+# logging
+# Set DEBUG=1 in the environment to enable verbose output, otherwise CRITICAL only.
 _log_level = logging.DEBUG if os.environ.get('DEBUG') == '1' else logging.CRITICAL
 logging.basicConfig(
     level=_log_level,
     format='[%(asctime)s] %(levelname)s %(name)s: %(message)s',
     datefmt='%H:%M:%S',
 )
-log = logging.getLogger('twitter2rss')
+log = logging.getLogger('tw2rss')
 
-# Config
-CACHE_TTL = 60
-DEFAULT_LIMIT = 20
-
-# auth pool — load from environment
+# auth_token pool — load from environment
 _raw_auths = os.environ.get('AUTH_TOKENS', '')
 auths = [t.strip() for t in _raw_auths.split(',') if t.strip()]
 if not auths:
-    raise RuntimeError("No AUTH_TOKENS found in environment. Set AUTH_TOKENS=token1,token2")
+    raise RuntimeError("No AUTH_TOKENS found in environment. Set `SetEnv AUTH_TOKENS token1,token2,token3` in server config")
 
 auth_token = random.choice(auths)
 ct0 = os.urandom(16).hex()
@@ -47,20 +53,12 @@ HEADERS = {
     'cookie': f'ct0={ct0}; auth_token={auth_token}',
 }
 
-# restored full feature flags
 FEATURES_USER = '{"hidden_profile_likes_enabled":false,"hidden_profile_subscriptions_enabled":true,"responsive_web_graphql_exclude_directive_enabled":true,"verified_phone_label_enabled":false,"subscriptions_verification_info_is_identity_verified_enabled":false,"subscriptions_verification_info_verified_since_enabled":true,"highlights_tweets_tab_ui_enabled":true,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"responsive_web_graphql_timeline_navigation_enabled":true}'
 
 FEATURES_TWEETS = '{"creator_subscriptions_tweet_preview_api_enabled":false,"communities_web_enable_tweet_community_results_fetch":false,"c9s_tweet_anatomy_moderator_badge_enabled":false,"articles_preview_enabled":false,"tweetypie_unmention_optimization_enabled":false,"responsive_web_edit_tweet_api_enabled":false,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":false,"view_counts_everywhere_api_enabled":false,"longform_notetweets_consumption_enabled":false,"responsive_web_twitter_article_tweet_consumption_enabled":false,"tweet_awards_web_tipping_enabled":false,"creator_subscriptions_quote_tweet_preview_enabled":false,"freedom_of_speech_not_reach_fetch_enabled":false,"standardized_nudges_misinfo":false,"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled":false,"tweet_with_visibility_results_prefer_gql_media_interstitial_enabled":false,"rweb_video_timestamps_enabled":false,"longform_notetweets_rich_text_read_enabled":true,"longform_notetweets_inline_media_enabled":true,"rweb_tipjar_consumption_enabled":false,"responsive_web_graphql_exclude_directive_enabled":false,"verified_phone_label_enabled":false,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"responsive_web_graphql_timeline_navigation_enabled":false,"responsive_web_enhance_cards_enabled":false,"rweb_lists_timeline_redesign_enabled":false,"responsive_web_media_download_video_enabled":false}'
 
-GET_USER_URL = 'https://x.com/i/api/graphql/SAMkL5y_N9pmahSw8yy6gw/UserByScreenName'
-GET_TWEETS_URL = 'https://x.com/i/api/graphql/XicnWRbyQ3WgVY__VataBQ/UserTweets'
-GET_TWEETS_AND_REPLIES_URL = 'https://x.com/i/api/graphql/-gxtzCQbBPmOwxnY-SbiHQ/UserTweetsAndReplies'
-
-TWEET_URL = 'http://nitter'
-
 cache = {}
 URL_RE = re.compile(r'(https?://[^\s]+)')
-
 
 def _log_request(prepared: requests.PreparedRequest) -> None:
     """Log the full outgoing request URL and headers at DEBUG level.
@@ -92,6 +90,9 @@ def _log_response(response: requests.Response, elapsed: float) -> None:
 def linkify(text: str) -> str:
     return URL_RE.sub(lambda m: f'<a href="{m.group(0)}">{m.group(0)}</a>', text or '')
 
+def to_rfc822(dt_str: str) -> str:
+    dt = datetime.strptime(dt_str, "%a %b %d %H:%M:%S %z %Y")
+    return dt.strftime("%a, %d %b %Y %H:%M:%S %z")
 
 def render_media(media_list):
     html = []
@@ -132,7 +133,7 @@ class TwitterRSS:
         elapsed = time.monotonic() - t0
 
         _log_response(r, elapsed)
-        log.info("GET %s  →  %s  (%.0fms)", url.split('/')[-1], r.status_code, elapsed * 1000)
+        log.info("GET %s - %s (%.0fms)", url.split('/')[-1], r.status_code, elapsed * 1000)
 
         r.raise_for_status()
         return r.json()
@@ -147,12 +148,12 @@ class TwitterRSS:
 
         try:
             t0 = time.monotonic()
-            response = self.session.get(GET_USER_URL, params=params, timeout=10)
+            response = self.session.get(USER_URL, params=params, timeout=10)
             elapsed = time.monotonic() - t0
 
             _log_request(response.request)
             _log_response(response, elapsed)
-            log.info("get_user @%s  →  %s  (%.0fms)", username, response.status_code, elapsed * 1000)
+            log.info("get_user @%s - %s (%.0fms)", username, response.status_code, elapsed * 1000)
 
             json_response = response.json()
         except requests.exceptions.JSONDecodeError:
@@ -171,13 +172,13 @@ class TwitterRSS:
         return user_info
 
     def get_tweets(self, username, limit=DEFAULT_LIMIT, with_replies=False):
-        log.info("get_tweets: @%s  limit=%d  with_replies=%s", username, limit, with_replies)
-        url = GET_TWEETS_AND_REPLIES_URL if with_replies else GET_TWEETS_URL
+        log.info("get_tweets: @%s limit=%d with_replies=%s", username, limit, with_replies)
+        url = TWEETS_AND_REPLIES_URL if with_replies else TWEETS_URL
 
         _user = self.get_user(username)
         full_name = _user.get("full_name")
         user_id = _user.get("id")
-        log.debug("get_tweets: resolved user_id=%s  full_name=%s", user_id, full_name)
+        log.debug("get_tweets: resolved user_id=%s full_name=%s", user_id, full_name)
 
         params = {
             'variables': json.dumps({
@@ -210,120 +211,240 @@ class TwitterRSS:
             for e in ins.get('entries', []):
                 entry_id = e.get('entryId', '')
 
-                # Cursor entries (Top/Bottom) are never tweets — skip immediately
-                # without counting them as parse errors.
                 if 'cursor' in entry_id.lower():
-                    log.debug("  skipped cursor entry: %s", entry_id)
+                    log.debug('skipped cursor entry: %s', entry_id)
                     continue
 
                 try:
-                    item_content = e['content']['itemContent']
-                    entry_type = item_content.get('itemType', '')
+                    content_block = e.get('content', {})
+                    entry_type = content_block.get('entryType', '')
 
-                    # Only process actual tweet entries
-                    if entry_type != 'TimelineTweet':
-                        log.debug("  skipped non-tweet entry type=%r  entryId=%s",
-                                  entry_type, entry_id)
+                    if entry_type == 'TimelineTimelineItem':
+                        item_content = content_block.get('itemContent', {})
+                        if item_content.get('itemType') != 'TimelineTweet':
+                            log.debug('skipped non-tweet entry type=%r entryId=%s',
+                                      item_content.get('itemType'), entry_id)
+                            continue
+                        parsed = self._parse_tweet_result(item_content, entry_id)
+                        if parsed:
+                            out.append(parsed)
+                            if len(out) >= limit:
+                                log.debug('get_tweets: hit limit %d, stopping early', limit)
+                                return out
+
+                    elif entry_type == 'TimelineTimelineModule':
+                        module_items = content_block.get('items', [])
+                        parsed_items = []
+                        for mi in module_items:
+                            mi_content = mi.get('item', {}).get('itemContent', {})
+                            if mi_content.get('itemType') != 'TimelineTweet':
+                                continue
+                            p = self._parse_tweet_result(mi_content, mi.get('entryId', ''))
+                            if p:
+                                parsed_items.append(p)
+                        if not parsed_items:
+                            continue
+                        reply_tweet = parsed_items[-1]
+                        if len(parsed_items) > 1:
+                            reply_tweet['reply_to'] = parsed_items[:-1]
+                        out.append(reply_tweet)
+                        log.debug('parsed conversation entryId=%s  items=%d  reply_id=%s',
+                                  entry_id, len(parsed_items), reply_tweet['id'])
+                        if len(out) >= limit:
+                            log.debug('get_tweets: hit limit %d, stopping early', limit)
+                            return out
+
+                    else:
+                        log.debug('skipped unknown entryType=%r entryId=%s', entry_type, entry_id)
                         continue
-
-                    result = item_content['tweet_results']['result']
-                    result_type = result.get('__typename', '')
-
-                    # 'tweetWithVisibilityResults' wraps the real tweet one level deeper
-                    if result_type == 'TweetWithVisibilityResults':
-                        result = result['tweet']
-                        log.debug("  unwrapped TweetWithVisibilityResults for entryId=%s", entry_id)
-                    elif result_type != 'Tweet':
-                        log.debug("  skipped unknown result __typename=%r  entryId=%s",
-                                  result_type, entry_id)
-                        continue
-
-                    t = result['legacy']
-                    user = result['core']['user_results']['result']['legacy']
-
-                    tid = t.get('id_str')
-                    media = t.get('extended_entities', {}).get('media', [])
-
-                    # Extract quoted tweet if present
-                    quoted = None
-                    qt_result = result.get('quoted_status_result', {}).get('result')
-                    if qt_result:
-                        qt_type = qt_result.get('__typename', '')
-                        if qt_type == 'TweetWithVisibilityResults':
-                            qt_result = qt_result['tweet']
-                        if qt_result.get('legacy'):
-                            qt_legacy = qt_result['legacy']
-                            qt_user = qt_result.get('core', {}).get('user_results', {}).get('result', {}).get('legacy', {})
-                            qt_tid = qt_legacy.get('id_str')
-                            quoted = {
-                                'id': qt_tid,
-                                'username': qt_user.get('screen_name'),
-                                'name': qt_user.get('name'),
-                                'content': qt_legacy.get('full_text'),
-                                'media': qt_legacy.get('extended_entities', {}).get('media', []),
-                                'tweet_url': f"{TWEET_URL}/{qt_user.get('screen_name')}/status/{qt_tid}",
-                            }
-                            log.debug("  found quoted tweet id=%s", qt_tid)
-
-                    out.append({
-                        'id': tid,
-                        'username': user.get('screen_name'),
-                        'name': user.get('name'),
-                        'published_at': t.get('created_at'),
-                        'content': t.get('full_text'),
-                        'media': media,
-                        'tweet_url': f"{TWEET_URL}/{user.get('screen_name')}/status/{tid}",
-                        'quoted': quoted,
-                    })
-                    log.debug("  parsed tweet id=%s  media=%d  quoted=%s",
-                              tid, len(media), quoted['id'] if quoted else None)
-
-                    if len(out) >= limit:
-                        log.debug("get_tweets: hit limit %d, stopping early", limit)
-                        return out
 
                 except Exception as exc:
                     skipped += 1
-                    log.debug("  skipped entry entryId=%s (parse error): %s", entry_id, exc)
+                    log.debug('skipped entry entryId=%s (parse error): %s', entry_id, exc)
                     continue
 
-        log.info("get_tweets: collected %d tweets, skipped %d entries", len(out), skipped)
+        log.info('get_tweets: collected %d tweets, skipped %d entries', len(out), skipped)
         return out
+
+    def _parse_tweet_result(self, item_content, entry_id=''):
+        result = item_content['tweet_results']['result']
+        result_type = result.get('__typename', '')
+        if result_type == 'TweetWithVisibilityResults':
+            result = result['tweet']
+        elif result_type != 'Tweet':
+            log.debug('  skipped unknown result __typename=%r entryId=%s', result_type, entry_id)
+            return None
+
+        t = result['legacy']
+        user = result['core']['user_results']['result']['legacy']
+        tid = t.get('id_str')
+
+        _rt_peek = t.get('retweeted_status_result', {}).get('result')
+        if _rt_peek:
+            _rt_peek = _rt_peek.get('tweet', _rt_peek)
+            media = _rt_peek.get('legacy', {}).get('extended_entities', {}).get('media', [])
+            if not media:
+                _rt_qt = _rt_peek.get('quoted_status_result', {}).get('result', {})
+                _rt_qt = _rt_qt.get('tweet', _rt_qt)
+                media = _rt_qt.get('legacy', {}).get('extended_entities', {}).get('media', [])
+        else:
+            media = t.get('extended_entities', {}).get('media', [])
+
+        retweeted = None
+        rt_result = t.get('retweeted_status_result', {}).get('result')
+        if rt_result:
+            rt_type = rt_result.get('__typename', '')
+            if rt_type == 'TweetWithVisibilityResults':
+                rt_result = rt_result['tweet']
+            if rt_result.get('legacy'):
+                rt_legacy = rt_result['legacy']
+                rt_user = rt_result.get('core', {}).get('user_results', {}).get('result', {}).get('legacy', {})
+                rt_tid = rt_legacy.get('id_str')
+                rt_quoted = None
+                rt_qt_result = rt_result.get('quoted_status_result', {}).get('result')
+                if rt_qt_result:
+                    rt_qt_result = rt_qt_result.get('tweet', rt_qt_result)
+                    if rt_qt_result.get('legacy'):
+                        rt_qt_legacy = rt_qt_result['legacy']
+                        rt_qt_user = rt_qt_result.get('core', {}).get('user_results', {}).get('result', {}).get('legacy', {})
+                        rt_qt_tid = rt_qt_legacy.get('id_str')
+                        rt_quoted = {
+                            'id': rt_qt_tid,
+                            'username': rt_qt_user.get('screen_name'),
+                            'name': rt_qt_user.get('name'),
+                            'content': rt_qt_legacy.get('full_text'),
+                            'media': rt_qt_legacy.get('extended_entities', {}).get('media', []),
+                            'tweet_url': f"{TWEET_URL}/{rt_qt_user.get('screen_name')}/status/{rt_qt_tid}",
+                        }
+                retweeted = {
+                    'id': rt_tid,
+                    'username': rt_user.get('screen_name'),
+                    'name': rt_user.get('name'),
+                    'content': rt_legacy.get('full_text'),
+                    'media': rt_legacy.get('extended_entities', {}).get('media', []),
+                    'tweet_url': f"{TWEET_URL}/{rt_user.get('screen_name')}/status/{rt_tid}",
+                    'quoted': rt_quoted,
+                }
+
+        quoted = None
+        qt_result = result.get('quoted_status_result', {}).get('result')
+        if qt_result:
+            qt_type = qt_result.get('__typename', '')
+            if qt_type == 'TweetWithVisibilityResults':
+                qt_result = qt_result['tweet']
+            if qt_result.get('legacy'):
+                qt_legacy = qt_result['legacy']
+                qt_user = qt_result.get('core', {}).get('user_results', {}).get('result', {}).get('legacy', {})
+                qt_tid = qt_legacy.get('id_str')
+                quoted = {
+                    'id': qt_tid,
+                    'username': qt_user.get('screen_name'),
+                    'name': qt_user.get('name'),
+                    'content': qt_legacy.get('full_text'),
+                    'media': qt_legacy.get('extended_entities', {}).get('media', []),
+                    'tweet_url': f"{TWEET_URL}/{qt_user.get('screen_name')}/status/{qt_tid}",
+                }
+
+        return {
+            'id': tid,
+            'username': user.get('screen_name'),
+            'name': user.get('name'),
+            'published_at': t.get('created_at'),
+            'content': t.get('full_text'),
+            'media': media,
+            'tweet_url': f"{TWEET_URL}/{user.get('screen_name')}/status/{tid}",
+            'retweeted': retweeted,
+            'quoted': quoted,
+            'reply_to': [],
+        }
 
     def build_rss(self, username, items):
         log.debug("build_rss: building feed for @%s with %d items", username, len(items))
         parts = []
 
         for t in items:
-            text_html = linkify(t['content'])
-            media_html = render_media(t.get('media', []))
-
-            quoted_html = ''
-            q = t.get('quoted')
-            if q:
-                q_text_html = linkify(q['content'])
-                q_media_html = render_media(q.get('media', []))
-                quoted_html = (
-                    f'<blockquote>'
-                    f'<b><a href="{q["tweet_url"]}">{q["name"]} @{q["username"]}</a></b><br/>'
-                    f'{q_text_html}{q_media_html}'
-                    f'</blockquote>'
+            rt = t.get('retweeted')
+            tweet_id = t['id']
+            tweet_url = f"{TWEET_URL}/{t['username']}/status/{tweet_id}"
+            if rt:
+                # Full retweet: show retweeter credit, then original tweet in full
+                rt_text_html = linkify(rt['content'])
+                rt_media_html = render_media(rt.get('media', []))
+                title_text = f"RT @{rt['username']}: {rt['content']}"
+                rt_quoted_html = ''
+                rt_q = rt.get('quoted')
+                if rt_q:
+                    rt_q_text_html = linkify(rt_q['content'])
+                    rt_q_media_html = render_media(rt_q.get('media', []))
+                    rt_quoted_html = (
+                        f'<blockquote>'
+                        f'<b><a href="{rt_q["tweet_url"]}">{rt_q["name"]} @{rt_q["username"]}</a></b><br/>'
+                        f'{rt_q_text_html}{rt_q_media_html}'
+                        f'</blockquote>'
+                    )
+                description_html = (
+                    f'<p><b>{t["name"]} @{t["username"]}</b> retweeted '
+                    f'<a href="{rt["tweet_url"]}"><b>{rt["name"]} @{rt["username"]}</b></a>:</p>'
+                    f'<blockquote>{rt_text_html}{rt_media_html}{rt_quoted_html}</blockquote>'
                 )
+            else:
+                text_html = linkify(t['content'])
+                media_html = render_media(t.get('media', []))
+                title_text = t['content']
+
+                quoted_html = ''
+                q = t.get('quoted')
+                if q:
+                    q_text_html = linkify(q['content'])
+                    q_media_html = render_media(q.get('media', []))
+                    quoted_html = (
+                        f'<blockquote>'
+                        f'<b><a href="{q["tweet_url"]}">{q["name"]} @{q["username"]}</a></b><br/>'
+                        f'{q_text_html}{q_media_html}'
+                        f'</blockquote>'
+                    )
+
+                # Render reply-to context (conversation thread parents)
+                reply_to_html = ''
+                for parent in t.get('reply_to', []):
+                    p_text_html = linkify(parent['content'])
+                    p_media_html = render_media(parent.get('media', []))
+                    p_quoted_html = ''
+                    pq = parent.get('quoted')
+                    if pq:
+                        pq_text_html = linkify(pq['content'])
+                        pq_media_html = render_media(pq.get('media', []))
+                        p_quoted_html = (
+                            f'<blockquote>'
+                            f'<b><a href="{pq["tweet_url"]}">{pq["name"]} @{pq["username"]}</a></b><br/>'
+                            f'{pq_text_html}{pq_media_html}'
+                            f'</blockquote>'
+                        )
+                    reply_to_html += (
+                        f'<blockquote>'
+                        f'<b><a href="{parent["tweet_url"]}">{parent["name"]} @{parent["username"]}</a></b><br/>'
+                        f'{p_text_html}{p_media_html}{p_quoted_html}'
+                        f'</blockquote>'
+                    )
+
+                description_html = f'{reply_to_html}{text_html}{media_html}{quoted_html}'
 
             parts.append(f"""
             <item>
-                <title><![CDATA[{t['content']}]]></title>
-                <description><![CDATA[{text_html}{media_html}{quoted_html}]]></description>
+                <title><![CDATA[{title_text}]]></title>
+                <description><![CDATA[{description_html}]]></description>
                 <link>{t['tweet_url']}</link>
-                <pubDate>{t['published_at']}</pubDate>
+                <guid isPermaLink="false">{tweet_id}</guid>
+                <pubDate>{to_rfc822(t['published_at'])}</pubDate>
             </item>
             """)
 
         feed = f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <rss version=\"2.0\">
   <channel>
-    <title>{username}</title>
+    <title>@{username}</title>
     <link>{TWEET_URL}/{username}</link>
+    <description>Twitter feed for @{username}</description>
     {''.join(parts)}
   </channel>
 </rss>"""
@@ -337,10 +458,9 @@ twitter = TwitterRSS()
 def parse_qs(qs):
     return dict(urllib.parse.parse_qsl(qs, keep_blank_values=True))
 
-
 def app(environ, start_response):
     params = parse_qs(environ.get('QUERY_STRING', ''))
-    username = params.get('user', 'elonmusk')
+    username = params.get('user', 'NASA')
     log.info("app: request  user=%s  qs=%s", username, environ.get('QUERY_STRING', ''))
 
     try:
@@ -383,7 +503,6 @@ def app(environ, start_response):
         log.exception("app: unhandled error for user=%s: %s", username, e)
         start_response('500 Internal Server Error', [('Content-Type', 'text/plain')])
         return [str(e).encode()]
-
 
 if __name__ == '__main__':
     import argparse
