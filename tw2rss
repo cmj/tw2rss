@@ -13,7 +13,7 @@ import requests
 from datetime import datetime
 
 # config
-TWEET_URL = 'http://nitter'
+TWEET_URL = 'http://nitter' # Nitter instance (or x.com) for urls
 CACHE_TTL = 60
 DEFAULT_LIMIT = 20
 GET_USER_URL = 'https://x.com/i/api/graphql/SAMkL5y_N9pmahSw8yy6gw/UserByScreenName'
@@ -124,7 +124,7 @@ class TwitterRSS:
         params = {
             'variables': json.dumps({
                 'userId': user_id,
-                'count': min(limit * 2, 100),  # request more so Twitter includes conversation modules
+                'count': min(limit, 20),
                 'includePromotedContent': False,
                 'withQuickPromoteEligibilityTweetFields': False,
                 'withVoice': True,
