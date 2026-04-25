@@ -406,7 +406,7 @@ def handle():
         ts, payload = cache[key]
         age = now - ts
         if age < CACHE_TTL:
-            sys.stdout.write('Content-Type: application/rss+xml\r\n\r\n')
+            sys.stdout.write('Content-Type: application/rss+xml; charset=UTF-8\r\n\r\n')
             sys.stdout.flush()
             sys.stdout.buffer.write(payload)
             return
@@ -418,7 +418,7 @@ def handle():
 
         cache[key] = (now, rss)
 
-        sys.stdout.write('Content-Type: application/rss+xml\r\n\r\n')
+        sys.stdout.write('Content-Type: application/rss+xml; charset=UTF-8\r\n\r\n')
         sys.stdout.flush()
         sys.stdout.buffer.write(rss)
     except Exception as e:
